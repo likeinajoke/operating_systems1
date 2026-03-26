@@ -9,7 +9,52 @@
 #include "buffer.h"
 #include "libcaesar/caesar.h"
 
+#define MAX_FILES 100
+
+char *files[MAX_FILES];
+int file_count = 0;
+int current_file = 0;
+char *outdir;
+
+pthread_mutex_t global_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+int files_done = 0;
+
 volatile int keep_running = 1;
+
+void write_log(const char *filename, const char *status)
+{
+    FILE *log = fopen("log.txt","a");
+    if(!log) return;
+
+    time_t now = time(NULL);
+    char *time_str = ctime(&now);
+
+    fprintf(log,"%s | thread %llu | %s | %s\n",
+            time_str,
+            (unsigned long long)pthread_self(),
+            filename,
+            status);
+
+    fclose(log);
+}
+
+int lock_with_timeout(pthread_mutex_t *mutex)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += 5;
+
+    int res = pthread_mutex_timedlock(mutex, &ts);
+
+    if(res == ETIMEDOUT)
+    {
+        printf("Deadlock warning: thread %llu waited too long\n", (unsigned long long)pthread_self());
+        return 0;
+    }
+
+    return 1;
+}
 
 typedef struct {
     FILE *input;
@@ -52,79 +97,74 @@ void show_progress(long done, long total)
     }
 }
 
-void* producer(void *arg)
+void* worker(void *arg)
 {
-    Context *ctx = (Context*)arg;
-    Buffer *buf = ctx->buffer;
+    int key = *(int*)arg;
 
-    while(keep_running)
+    while(1)
     {
-        pthread_mutex_lock(&buf->mutex);
+        while(!lock_with_timeout(&global_mutex));
 
-        while(buf->full && keep_running)
-            pthread_cond_wait(&buf->can_produce,&buf->mutex);
-
-        if(!keep_running)
+        if(current_file >= file_count)
         {
-            pthread_mutex_unlock(&buf->mutex);
+            pthread_mutex_unlock(&global_mutex);
             break;
         }
 
-        size_t n = fread(buf->data,1,BUFFER_SIZE,ctx->input);
+        char *filename = files[current_file];
+        current_file++;
 
-        if(n == 0)
+        pthread_mutex_unlock(&global_mutex);
+
+        FILE *in = fopen(filename,"rb");
+
+        if(!in)
         {
-            buf->finished = 1;
-            pthread_cond_signal(&buf->can_consume);
-            pthread_mutex_unlock(&buf->mutex);
-            break;
+            write_log(filename,"error open");
+            continue;
         }
 
-        set_key(ctx->key);
-        caesar(buf->data, buf->data, n);
+        
+        char *base = strrchr(filename, '/');
+        if(!base)
+            base = strrchr(filename, '\\');
 
-        buf->size = n;
-        buf->full = 1;
+        if(base)
+            base++;
+        else
+            base = filename;
+        
+        char outname[256];
+        sprintf(outname,"%s/%s", outdir, base);
 
-        pthread_cond_signal(&buf->can_consume);
-        pthread_mutex_unlock(&buf->mutex);
-    }
+        FILE *out = fopen(outname,"wb");
 
-    return NULL;
-}
-
-void* consumer(void *arg)
-{
-    Context *ctx = (Context*)arg;
-    Buffer *buf = ctx->buffer;
-
-    while(keep_running)
-    {
-        pthread_mutex_lock(&buf->mutex);
-
-        while(!buf->full && !buf->finished && keep_running)
-            pthread_cond_wait(&buf->can_consume,&buf->mutex);
-
-        if(buf->full)
+        if(!out)
         {
-            fwrite(buf->data,1,buf->size,ctx->output);
-
-            ctx->processed += buf->size;
-
-            show_progress(ctx->processed,ctx->total_size);
-
-            buf->full = 0;
-
-            pthread_cond_signal(&buf->can_produce);
+            write_log(filename,"error output");
+            fclose(in);
+            continue;
         }
 
-        if(buf->finished)
+        char buffer[BUFFER_SIZE];
+
+        size_t n;
+
+        while((n = fread(buffer,1,BUFFER_SIZE,in)) > 0)
         {
-            pthread_mutex_unlock(&buf->mutex);
-            break;
+            set_key(key);
+            caesar(buffer, buffer, n);
+            fwrite(buffer,1,n,out);
         }
 
-        pthread_mutex_unlock(&buf->mutex);
+        fclose(in);
+        fclose(out);
+
+        pthread_mutex_lock(&global_mutex);
+        files_done++;
+        pthread_mutex_unlock(&global_mutex);
+
+        write_log(filename,"success");
     }
 
     return NULL;
@@ -140,67 +180,41 @@ long get_file_size(FILE *f)
 
 int main(int argc,char *argv[])
 {
-    if(argc != 4)
+    if(argc < 4)
     {
-        fprintf(stderr, "Usage: ./secure_copy input output key\n");
+        fprintf(stderr, "Usage: ./secure_copy file1 file2 ... outdir key\n");
         return 1;
     }
 
     signal(SIGINT,sigint_handler);
 
-    FILE *input = fopen(argv[1],"rb");
+    int key = atoi(argv[argc - 1]);
+    file_count = argc - 3;
+    outdir = argv[argc-2];
 
-    if(!input)
+    for(int i = 0; i < file_count; i++)
     {
-        perror("Ошибка открытия входного файла");
-        return 1;
+        files[i] = argv[i+1];
     }
 
-    FILE *output = fopen(argv[2],"wb");
+    char *outdir = argv[argc-2];
 
-    if(!output)
+    current_file = 0;
+    files_done = 0;
+
+    mkdir(outdir);
+
+    pthread_t threads[3];
+
+    for(int i = 0; i < 3; i++)
     {
-        perror("Ошибка создания выходного файла");
-        fclose(input);
-        return 1;
+        pthread_create(&threads[i], NULL, worker, &key);
     }
 
-    int key = atoi(argv[3]);
-
-    Buffer buffer;
-
-    buffer.full = 0;
-    buffer.finished = 0;
-
-    pthread_mutex_init(&buffer.mutex,NULL);
-    pthread_cond_init(&buffer.can_produce,NULL);
-    pthread_cond_init(&buffer.can_consume,NULL);
-
-    Context ctx;
-
-    ctx.input = input;
-    ctx.output = output;
-    ctx.buffer = &buffer;
-    ctx.key = key;
-
-    ctx.total_size = get_file_size(input);
-    ctx.processed = 0;
-
-    pthread_t producer_thread;
-    pthread_t consumer_thread;
-
-    pthread_create(&producer_thread,NULL,producer,&ctx);
-    pthread_create(&consumer_thread,NULL,consumer,&ctx);
-
-    pthread_join(producer_thread,NULL);
-    pthread_join(consumer_thread,NULL);
-
-    fclose(input);
-    fclose(output);
-
-    pthread_mutex_destroy(&buffer.mutex);
-    pthread_cond_destroy(&buffer.can_produce);
-    pthread_cond_destroy(&buffer.can_consume);
+    for(int i = 0; i < 3; i++)
+    {
+        pthread_join(threads[i], NULL);
+    }
 
     if(!keep_running)
         printf("\nОперация прервана пользователем\n");
