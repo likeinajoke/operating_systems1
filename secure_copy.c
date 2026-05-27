@@ -5,6 +5,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
+#include <fcntl.h>
 #include <time.h>
 #include <errno.h>
 
@@ -12,7 +14,7 @@
 #include "libcaesar/caesar.h"
 
 #define MAX_FILES 100
-#define THREAD_COUNT 4
+#define THREAD_COUNT 3
 
 typedef enum
 {
@@ -40,6 +42,15 @@ pthread_mutex_t global_mutex = PTHREAD_MUTEX_INITIALIZER;
 int files_done = 0;
 
 volatile int keep_running = 1;
+
+typedef struct
+{
+    void *memory;
+    size_t size;
+
+} ProtectedKey;
+
+ProtectedKey protected_key;
 
 double get_time()
 {
@@ -95,6 +106,115 @@ typedef struct {
 
 } Context;
 
+void segv_handler(int sig, siginfo_t *info, void *context)
+{
+    (void)sig;
+    (void)context;
+
+    fprintf(stderr,
+            "\nSECURITY ERROR: illegal access to protected memory at %p\n",
+            info->si_addr);
+
+    if(protected_key.memory != NULL)
+    {
+        mprotect(protected_key.memory,
+                 protected_key.size,
+                 PROT_READ | PROT_WRITE);
+
+        memset(protected_key.memory,0,protected_key.size);
+
+        munmap(protected_key.memory, protected_key.size);
+    }
+
+    exit(1);
+}
+
+void setup_signal_handler()
+{
+    struct sigaction sa;
+
+    sa.sa_flags = SA_SIGINFO;
+    sa.sa_sigaction = segv_handler;
+
+    sigemptyset(&sa.sa_mask);
+
+    sigaction(SIGSEGV,&sa,NULL);
+}
+
+void init_protected_key(int key)
+{
+    protected_key.size = sizeof(int);
+
+    protected_key.memory = mmap(NULL,
+                                protected_key.size,
+                                PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS,
+                                -1,
+                                0);
+
+    if(protected_key.memory == MAP_FAILED)
+    {
+        perror("mmap failed");
+        exit(1);
+    }
+
+    memcpy(protected_key.memory, &key, sizeof(int));
+
+    if(mprotect(protected_key.memory,
+                protected_key.size,
+                PROT_NONE) != 0)
+    {
+        perror("mprotect failed");
+        exit(1);
+    }
+}
+
+int get_protected_key()
+{
+    if(mprotect(protected_key.memory,
+                protected_key.size,
+                PROT_READ) != 0)
+    {
+        perror("mprotect read failed");
+        exit(1);
+    }
+
+    int key;
+
+    memcpy(&key, protected_key.memory, sizeof(int));
+
+    if(mprotect(protected_key.memory,
+                protected_key.size,
+                PROT_NONE) != 0)
+    {
+        perror("mprotect reset failed");
+        exit(1);
+    }
+
+    return key;
+}
+
+void destroy_protected_key()
+{
+    if(protected_key.memory == NULL)
+        return;
+
+    mprotect(protected_key.memory,
+             protected_key.size,
+             PROT_READ | PROT_WRITE);
+
+    memset(protected_key.memory,0,protected_key.size);
+
+    mprotect(protected_key.memory,
+             protected_key.size,
+             PROT_NONE);
+
+    munmap(protected_key.memory,
+           protected_key.size);
+
+    protected_key.memory = NULL;
+}
+
 void sigint_handler(int sig)
 {
     (void)sig;
@@ -125,7 +245,7 @@ void show_progress(long done, long total)
     }
 }
 
-void process_file(const char *filename, int key)
+void process_file(const char *filename)
 {
     FILE *in = fopen(filename, "rb");
 
@@ -189,7 +309,7 @@ void process_file(const char *filename, int key)
 
 void* worker(void *arg)
 {
-    int key = *(int*)arg;
+    (void)arg;
 
     while(keep_running)
     {
@@ -205,13 +325,12 @@ void* worker(void *arg)
         current_file++;
 
         pthread_mutex_unlock(&global_mutex);
-        process_file(filename, key);
+        
+        process_file(filename);
 
         pthread_mutex_lock(&global_mutex);
         files_done++;
         pthread_mutex_unlock(&global_mutex);
-
-        write_log(filename,"success");
     }
 
     return NULL;
@@ -225,7 +344,7 @@ long get_file_size(FILE *f)
     return size;
 }
 
-Statistics run_sequential(int key)
+Statistics run_sequential()
 {
     Statistics stats;
 
@@ -233,7 +352,7 @@ Statistics run_sequential(int key)
 
     for(int i = 0; i < file_count; i++)
     {
-        process_file(files[i], key);
+        process_file(files[i]);
 
         files_done++;
     }
@@ -244,12 +363,15 @@ Statistics run_sequential(int key)
 
     stats.processed_files = files_done;
 
-    stats.avg_time = stats.total_time / files_done;
+    if(files_done > 0)
+        stats.avg_time = stats.total_time / files_done;
+    else
+        stats.avg_time = 0;
 
     return stats;
 }
 
-Statistics run_parallel(int key)
+Statistics run_parallel()
 {
     Statistics stats;
 
@@ -259,7 +381,7 @@ Statistics run_parallel(int key)
 
     for(int i = 0; i < THREAD_COUNT; i++)
     {
-        pthread_create(&threads[i], NULL, worker, &key);
+        pthread_create(&threads[i], NULL, worker, NULL);
     }
 
     for(int i = 0; i < THREAD_COUNT; i++)
@@ -273,7 +395,10 @@ Statistics run_parallel(int key)
 
     stats.processed_files = files_done;
 
-    stats.avg_time = stats.total_time / files_done;
+    if(files_done > 0)
+        stats.avg_time = stats.total_time / files_done;
+    else
+        stats.avg_time = 0;
 
     return stats;
 }
@@ -287,6 +412,7 @@ int main(int argc,char *argv[])
     }
 
     signal(SIGINT,sigint_handler);
+    setup_signal_handler();
     Mode mode = MODE_AUTO;
     
     if(strcmp(argv[1], "--mode=sequential") == 0)
@@ -309,20 +435,24 @@ int main(int argc,char *argv[])
     }
     
     int key = atoi(argv[argc - 1]);
+    init_protected_key(key);
+
+    ///int *hack = (int*)protected_key.memory;
+
+    ///*hack = 999;
+    
     file_count = argc - 4;
     outdir = argv[argc-2];
 
     for(int i = 0; i < file_count; i++)
     {
-        files[i] = argv[i+1];
+        files[i] = argv[i+2];
     }
-
-    char *outdir = argv[argc-2];
 
     current_file = 0;
     files_done = 0;
 
-    mkdir(outdir);
+    mkdir(outdir? 0777);
 
     if(mode == MODE_AUTO)
     {
@@ -342,13 +472,13 @@ int main(int argc,char *argv[])
     {
         printf("Running sequential mode\n");
 
-        stats = run_sequential(key);
+        stats = run_sequential();
     }
     else
     {
         printf("Running parallel mode\n");
 
-        stats = run_parallel(key);
+        stats = run_parallel();
     }
 
     if(!keep_running)
@@ -361,5 +491,7 @@ int main(int argc,char *argv[])
 
     printf("Average per file: %.3f sec\n", stats.avg_time);
 
+    destroy_protected_key();
+    
     return 0;
 }
