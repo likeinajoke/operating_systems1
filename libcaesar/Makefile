@@ -2,7 +2,7 @@ CC = gcc
 CFLAGS = -Wall -Wextra -pedantic -fPIC
 LDFLAGS = -shared
 
-LIBNAME = libcaesar.dll
+LIBNAME = libcaesar.so
 
 SRC = caesar.c
 OBJ = caesar.o
@@ -16,7 +16,7 @@ $(OBJ): $(SRC)
 	$(CC) $(CFLAGS) -c $(SRC)
 
 install:
-	cp $(LIBNAME) /mingw64/bin/
+	cp $(LIBNAME) /usr/local/lib/
 
 test:
 	python test.py
